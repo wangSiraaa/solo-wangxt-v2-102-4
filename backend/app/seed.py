@@ -4,6 +4,7 @@ from __future__ import annotations
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
+from . import proposals_service as psvc
 from .config import DATABASE_URL
 from .db import Base, CarrierRow, MaskRow, Scenario
 from .services.masks import MASKS
@@ -71,6 +72,10 @@ def seed(engine) -> None:
             )
             sc.carriers = [CarrierRow(**kw) for kw in DEMO_CARRIERS]
             s.add(sc)
+            s.flush()
+            # 演示场景同样有 revision 0 的不可变基准快照
+            content = psvc.scenario_content_dict(sc)
+            psvc.append_baseline_zero(s, sc, content, "初始教学基准")
         s.commit()
 
 

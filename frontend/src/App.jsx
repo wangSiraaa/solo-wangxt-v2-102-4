@@ -7,6 +7,8 @@ import PowerSummary from './components/PowerSummary.jsx'
 import BandChart from './components/BandChart.jsx'
 import SpectrumChart from './components/SpectrumChart.jsx'
 import MaskPreview from './components/MaskPreview.jsx'
+import ProposalList from './components/ProposalList.jsx'
+import ProposalWorkspace from './components/ProposalWorkspace.jsx'
 
 const EMPTY_RULES = { guard_required_mhz: 1.0, leakage_limit_dbm: -45.0, reuse_policy: {} }
 
@@ -22,6 +24,7 @@ export default function App() {
   const [band, setBand] = useState({ low: 80, high: 220 })
   const [scenarios, setScenarios] = useState([])
   const [scenarioId, setScenarioId] = useState(null)
+  const [scenarioDetail, setScenarioDetail] = useState(null)
   const [scenarioName, setScenarioName] = useState('未命名场景')
   const [analysis, setAnalysis] = useState(null)
   const [plan, setPlan] = useState(null)
@@ -31,6 +34,10 @@ export default function App() {
   const [selectedPair, setSelectedPair] = useState(null)
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
+  // 版本化调频提案
+  const [proposals, setProposals] = useState([])
+  const [proposalId, setProposalId] = useState(null)
+  const [proposalTick, setProposalTick] = useState(0)
 
   useEffect(() => {
     api.masks().then(setMasks).catch((e) => setError(String(e)))
@@ -39,6 +46,13 @@ export default function App() {
 
   const refreshScenarios = () =>
     api.listScenarios().then(setScenarios).catch(() => {})
+
+  const refreshProposals = useCallback(() => {
+    if (!scenarioId) { setProposals([]); return }
+    api.listProposals(scenarioId).then(setProposals).catch(() => {})
+  }, [scenarioId])
+
+  useEffect(() => { refreshProposals() }, [refreshProposals, proposalTick])
 
   const runAnalyze = useCallback(async () => {
     setBusy('analyze'); setError(''); setPlan(null)
@@ -75,16 +89,17 @@ export default function App() {
   }, [carriers, rules, band, planMode])
 
   const loadScenario = async (id) => {
-    if (!id) { setScenarioId(null); return }
+    if (!id) { setScenarioId(null); setScenarioDetail(null); setProposalId(null); return }
     setBusy('load'); setError('')
     try {
       const sc = await api.getScenario(id)
-      setScenarioId(sc.id); setScenarioName(sc.name)
+      setScenarioId(sc.id); setScenarioName(sc.name); setScenarioDetail(sc)
       setCarriers(sc.carriers.map(({ id, ...c }) => c))
       setRules({ guard_required_mhz: sc.guard_required_mhz,
                  leakage_limit_dbm: sc.leakage_limit_dbm, reuse_policy: sc.reuse_policy || {} })
       setBand({ low: sc.band_low_mhz, high: sc.band_high_mhz })
       setAnalysis(null); setPlan(null); setSelectedPair(null)
+      setProposalId(null)
     } catch (e) { setError(e.message) } finally { setBusy('') }
   }
 
@@ -100,7 +115,10 @@ export default function App() {
         ? await api.updateScenario(scenarioId, payload)
         : await api.createScenario(payload)
       setScenarioId(saved.id)
+      const fresh = await api.getScenario(saved.id)
+      setScenarioDetail(fresh)
       await refreshScenarios()
+      setProposalTick((t) => t + 1)
     } catch (e) { setError(e.message) } finally { setBusy('') }
   }
 
@@ -109,8 +127,9 @@ export default function App() {
     setBusy('del'); setError('')
     try {
       await api.deleteScenario(scenarioId)
-      setScenarioId(null)
+      setScenarioId(null); setScenarioDetail(null); setProposalId(null)
       await refreshScenarios()
+      setProposalTick((t) => t + 1)
     } catch (e) { setError(e.message) } finally { setBusy('') }
   }
 
@@ -159,7 +178,17 @@ export default function App() {
               </button>
               {scenarioId && <button className="danger" onClick={deleteScenario} disabled={!!busy}>删除</button>}
             </div>
+            {scenarioId && (
+              <div className="hint" style={{ marginTop: 4 }}>
+                教学基准修订号 rev {scenarioDetail?.current_revision ?? 0}：直接“更新”会追加不可变基准版本。
+              </div>
+            )}
           </div>
+
+          <ProposalList scenarioId={scenarioId} scenario={scenarioDetail}
+                        proposals={proposals} selectedId={proposalId}
+                        onSelect={setProposalId}
+                        onChanged={() => setProposalTick((t) => t + 1)} />
 
           <div className="panel">
             <h2>载波录入</h2>
@@ -191,7 +220,23 @@ export default function App() {
             <div className="tabs">
               <button className={tab === 'spectrum' ? 'on' : ''} onClick={() => setTab('spectrum')}>频段与发射谱</button>
               <button className={tab === 'masks' ? 'on' : ''} onClick={() => setTab('masks')}>掩模库</button>
+              <button className={tab === 'proposal' ? 'on' : ''} onClick={() => setTab('proposal')}>
+                调频提案{proposals.length ? `（${proposals.length}）` : ''}
+              </button>
             </div>
+
+            {tab === 'proposal' && (
+              proposalId
+                ? <ProposalWorkspace key={proposalId} proposalId={proposalId}
+                                     scenario={scenarioDetail} masks={masks}
+                                     onProposalChanged={() => {
+                                       setProposalTick((t) => t + 1)
+                                       if (scenarioId) {
+                                         api.getScenario(scenarioId).then(setScenarioDetail).catch(() => {})
+                                       }
+                                     }} />
+                : <div className="hint">请在左列选择一个提案，或从当前基准创建草稿。</div>
+            )}
 
             {tab === 'spectrum' && (
               <>
