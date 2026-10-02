@@ -11,12 +11,15 @@ from sqlalchemy.orm import Session
 
 from .assemble import bands_view, build_spectrum, to_domain, to_rules, validate_masks
 from .config import CORS_ORIGINS, DATABASE_URL
-from .db import Base, CarrierRow, MaskRow, Scenario
+from .db import (Base, CarrierRow, MaskRow, Scenario, ScenarioVersion)
+from .proposals_api import configure as configure_proposals
+from .proposals_api import router as proposals_router
 from .schemas import (AnalyzeRequest, MaskOut, PlanRequest, ScenarioIn,
                       ScenarioOut, ScenarioSummary)
 from .seed import seed
 from .services.analysis import Carrier, analyze
 from .services.planner import BandLimits, plan
+from .services.snapshots import snapshot_from_scenario, snapshot_hash
 
 app = FastAPI(
     title="频谱工作台 API（离线教学模型）",
@@ -32,12 +35,32 @@ app.add_middleware(
 )
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+# 提案路由复用同一 engine（直接分析/规划流程保持无状态不变）
+configure_proposals(engine)
+app.include_router(proposals_router)
 
 
 @app.on_event("startup")
 def _startup() -> None:
     Base.metadata.create_all(engine)
     seed(engine)
+    _ensure_baseline_versions()
+
+
+def _ensure_baseline_versions() -> None:
+    """为所有场景补齐 v0 基准快照（首次升级时，幂等）。"""
+    with Session(engine) as s:
+        for sc in list(s.scalars(select(Scenario))):
+            exists = s.scalar(select(ScenarioVersion.version).where(
+                ScenarioVersion.scenario_id == sc.id,
+                ScenarioVersion.version == 0))
+            if exists is None:
+                snap = snapshot_from_scenario(sc)
+                s.add(ScenarioVersion(
+                    scenario_id=sc.id, version=0, kind="baseline",
+                    snapshot=snap, snapshot_hash=snapshot_hash(snap),
+                    note="初始教学基准（系统补齐）"))
+        s.commit()
 
 
 # ---- 计算接口（无状态，数据由前端提交） -----------------------------------
@@ -104,7 +127,17 @@ def _row_to_out(sc: Scenario) -> ScenarioOut:
         leakage_limit_dbm=sc.leakage_limit_dbm,
         reuse_policy=sc.reuse_policy or {},
         carriers=[_carrier_out(c) for c in sorted(sc.carriers, key=lambda c: c.position)],
+        version=sc.version,
     )
+
+
+def _write_snapshot_version(s: Session, sc: Scenario, kind: str,
+                            note: str = "") -> None:
+    """直接编辑（非提案）路径：推进版本并落不可变快照。"""
+    snap = snapshot_from_scenario(sc)
+    s.add(ScenarioVersion(
+        scenario_id=sc.id, version=sc.version, kind=kind,
+        snapshot=snap, snapshot_hash=snapshot_hash(snap), note=note))
 
 
 @app.get("/api/scenarios", response_model=list[ScenarioSummary])
@@ -112,7 +145,7 @@ def list_scenarios() -> list[ScenarioSummary]:
     with Session(engine) as s:
         rows = list(s.scalars(select(Scenario).order_by(Scenario.id)))
         return [ScenarioSummary(id=r.id, name=r.name, description=r.description,
-                                carrier_count=len(r.carriers),
+                                carrier_count=len(r.carriers), version=r.version,
                                 created_at=r.created_at.isoformat() if r.created_at else None)
                 for r in rows]
 
@@ -140,7 +173,7 @@ def create_scenario(req: ScenarioIn) -> ScenarioOut:
             band_low_mhz=req.band_low_mhz, band_high_mhz=req.band_high_mhz,
             guard_required_mhz=req.guard_required_mhz,
             leakage_limit_dbm=req.leakage_limit_dbm,
-            reuse_policy=dict(req.reuse_policy),
+            reuse_policy=dict(req.reuse_policy), version=0,
             carriers=[
                 CarrierRow(position=i, name=c.name, center_mhz=c.center_mhz,
                            bandwidth_mhz=c.bandwidth_mhz, power_dbm=c.power_dbm,
@@ -149,6 +182,8 @@ def create_scenario(req: ScenarioIn) -> ScenarioOut:
             ],
         )
         s.add(sc)
+        s.flush()
+        _write_snapshot_version(s, sc, "baseline", "创建场景（v0 基准）")
         s.commit()
         s.refresh(sc)
         return _row_to_out(sc)
@@ -179,6 +214,7 @@ def update_scenario(scenario_id: int, req: ScenarioIn) -> ScenarioOut:
             Scenario.name == req.name.strip(), Scenario.id != scenario_id))
         if other is not None:
             raise HTTPException(409, f"场景名 {req.name!r} 已存在")
+        old_version = sc.version
         sc.name = req.name.strip()
         sc.description = req.description
         sc.band_low_mhz = req.band_low_mhz
@@ -192,6 +228,10 @@ def update_scenario(scenario_id: int, req: ScenarioIn) -> ScenarioOut:
                        polarization=c.polarization, mask_name=c.mask_name)
             for i, c in enumerate(req.carriers)
         ]
+        sc.version = old_version + 1
+        s.flush()
+        _write_snapshot_version(s, sc, "baseline",
+                                f"直接编辑场景（v{old_version} → v{sc.version}）")
         s.commit()
         s.refresh(sc)
         return _row_to_out(sc)

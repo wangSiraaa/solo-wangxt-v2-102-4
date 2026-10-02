@@ -78,6 +78,7 @@ class ScenarioSummary(BaseModel):
     name: str
     description: str
     carrier_count: int
+    version: int = 0
     created_at: Optional[str] = None
 
 
@@ -91,6 +92,7 @@ class ScenarioOut(BaseModel):
     leakage_limit_dbm: float
     reuse_policy: dict[str, str]
     carriers: list[CarrierOut]
+    version: int = 0
 
 
 class MaskOut(BaseModel):
@@ -98,3 +100,124 @@ class MaskOut(BaseModel):
     points: list[list[float]]
     span_mhz: float
     description: str
+
+
+# ---- 版本化调频提案 --------------------------------------------------------
+
+# 提案内容复用场景内容结构（不含场景名等场景元数据时也合法）
+ScenarioContent = ScenarioIn
+
+PROPOSAL_STATUSES = ("draft", "reviewed", "applied", "cancelled", "rolled_back")
+ProposalStatus = Literal["draft", "reviewed", "applied", "cancelled", "rolled_back"]
+
+
+class ProposalCreateIn(BaseModel):
+    scenario_id: int
+    title: str = Field(min_length=1, max_length=128)
+    description: str = ""
+    # 草稿内容；为空时复制当前基准（无差异草稿，便于先建后改）
+    content: Optional[ScenarioContent] = None
+    note: str = ""
+
+
+class ProposalReviseIn(BaseModel):
+    content: ScenarioContent
+    note: str = ""
+
+
+class ProposalDecisionIn(BaseModel):
+    note: str = ""
+
+
+class ProposalPlanIn(BaseModel):
+    mode: Literal["guard_only", "mask_aware"] = "mask_aware"
+
+
+class RevisionOut(BaseModel):
+    revision: int
+    snapshot_hash: str
+    diff: dict
+    note: str
+    created_by: str
+    created_at: Optional[str] = None
+    # 当前修订上的产物概要（前端用来判断“规划是否过期”）
+    artifacts: list["ArtifactOut"] = Field(default_factory=list)
+
+
+class ArtifactOut(BaseModel):
+    id: int
+    revision: int
+    kind: Literal["analysis", "plan"]
+    mode: Optional[str] = None
+    input_snapshot_hash: str
+    post_check_ok: bool = False
+    payload: dict
+    created_at: Optional[str] = None
+
+
+class EventOut(BaseModel):
+    sequence: int
+    event_type: str
+    from_status: Optional[str] = None
+    to_status: Optional[str] = None
+    actor: str = ""
+    note: str = ""
+    detail: dict = Field(default_factory=dict)
+    created_at: Optional[str] = None
+
+
+class ProposalSummary(BaseModel):
+    id: int
+    scenario_id: int
+    title: str
+    status: ProposalStatus
+    base_version: int
+    revision_count: int
+    applied_version: Optional[int] = None
+    rolled_back_to_version: Optional[int] = None
+    created_by: str = ""
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    # 最新修订相对基准的差异概要
+    diff_summary: Optional[dict] = None
+
+
+class ProposalOut(BaseModel):
+    id: int
+    scenario_id: int
+    title: str
+    description: str
+    status: ProposalStatus
+    base_version: int
+    base_snapshot_hash: str
+    applied_version: Optional[int] = None
+    rolled_back_to_version: Optional[int] = None
+    created_by: str = ""
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    # 锚定基准快照 + 当前草稿快照 + 累计差异
+    base_snapshot: dict
+    current_revision: int
+    current_snapshot: dict
+    current_snapshot_hash: str
+    diff_base: dict
+    revisions: list[RevisionOut]
+    events: list[EventOut]
+    # 场景当前版本：前端可提示“基准已被他人修改”
+    scenario_current_version: int
+    baseline_changed: bool
+
+
+class ScenarioVersionOut(BaseModel):
+    version: int
+    kind: str
+    snapshot_hash: str
+    proposal_id: Optional[int] = None
+    note: str = ""
+    actor: str = ""
+    created_at: Optional[str] = None
+    snapshot: Optional[dict] = None
+    diff_from_previous: Optional[dict] = None
+
+
+RevisionOut.model_rebuild()

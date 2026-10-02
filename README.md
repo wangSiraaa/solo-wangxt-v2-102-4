@@ -26,6 +26,9 @@ backend/   FastAPI 应用
   app/services/masks.py     掩模折线、发射谱曲线（SciPy interp1d）
   app/services/analysis.py  三类冲突检查（定位到载波对/方向）
   app/services/planner.py   OR-Tools CP-SAT 频率规划
+  app/services/snapshots.py 场景快照、SHA-256 内容哈希、提案结构化差异
+  app/services/proposals.py 版本化调频提案工作流（状态机/乐观并发/post-check/审计）
+  app/proposals_api.py      提案与场景版本的 FastAPI 路由
   app/db.py / seed.py       SQLAlchemy 模型与教学演示场景
 frontend/  React + Plotly.js
 scripts/   start-dev.sh     一键启动（本地 PostgreSQL + 后端 + 前端）
@@ -98,6 +101,55 @@ CP-SAT 在 1 kHz 网格上为每个载波选中心频率，约束：
 | C1(H) / C6(V) 同频 | 规则 unknown → “复用待评估” |
 | C11(RHCP) / C12(V) 同频 | 规则 allowed → 无冲突 |
 
+## 版本化调频提案（教学基准保护）
+
+教师/学生可以为**现有场景**提出调频方案、反复比较差异，但未经确认的草稿**绝不覆盖教学基准**。
+前端在「调频提案（版本化）」页签操作；后端复用现有分析与规划服务，无状态的
+`POST /api/analyze`、`POST /api/plan` 直接分析行为保持不变。
+
+**快照与哈希**：场景内容（载波中心频率/带宽/功率/极化/掩模 + 保护间隔 + 泄漏限值 +
+极化复用规则 + 可用频段）经规范化（键排序、浮点统一到 1 Hz 精度）后取 SHA-256。
+提案创建时锚定基准 `base_version + base_snapshot_hash`；每次草稿改动产生新修订，
+分析/规划产物都绑定**输入快照哈希 + 修订号**。
+
+**状态机**：
+
+```
+draft ──review──▶ reviewed ──apply──▶ applied ──rollback──▶ rolled_back
+  ▲                  │
+  └──── reopen ──────┘
+draft / reviewed ──cancel──▶ cancelled
+```
+
+**应用（`POST /api/proposals/{id}/apply`）的三道闸，任一失败整体拒绝、零部分写入**：
+
+1. **乐观并发校验**：场景 `version` 必须仍等于提案锚定的 `base_version`，且当前内容哈希
+   等于 `base_snapshot_hash`（基准被他人直接修改即 409 `baseline_conflict`）；
+   写入用 `UPDATE ... WHERE version=:base` 条件更新兜底检查—写入之间的并发；
+2. **规划有效性**：最新修订必须存在规划产物，且其 `input_snapshot_hash` 等于该修订快照哈希；
+   草稿改动后旧修订的规划立即失效（409 `plan_expired`），必须重新规划并重新采纳；
+3. **post-check**：应用前对提案目标内容重跑一遍完整 `analyze`，存在 error 即
+   409 `post_check_failed`，事务回滚。
+
+被拒绝的应用尝试也写一条 `apply_rejected` 审计事件。重复应用/取消/回退请求幂等：
+已处于目标状态时直接返回，不产生新版本、不重复写事件。回退把场景恢复为提案锚定的基准
+内容并产生 `rollback` 版本快照（若应用后场景又被推进，则拒绝回退而非覆盖他人基准）。
+
+**差异**记录四类教学关注点：载波频率移动（含偏移量）、掩模变化、极化复用规则变化、
+保护间隔/泄漏限值/频段变化；修订差异相对上一修订，同时保留相对基准的累计差异。
+
+主要接口：
+
+| 方法 路径 | 说明 |
+|---|---|
+| `POST /api/proposals` | 从当前场景创建草稿快照（`content` 缺省=复制基准） |
+| `PUT /api/proposals/{id}` | 草稿修订（仅 draft；内容相同拒绝） |
+| `POST /api/proposals/{id}/analysis` / `/plan?mode=` | 在当前修订上生成绑定哈希的分析/规划产物 |
+| `POST /api/proposals/{id}/accept-plan` | 采纳当前修订规划为新修订（在新修订上重跑分析/规划） |
+| `POST /api/proposals/{id}/review` `/reopen` `/cancel` `/apply` `/rollback` | 状态迁移（均幂等/带审计） |
+| `GET /api/scenarios/{id}/versions[/{v}]` | 场景版本链（baseline/proposal_applied/rollback）与版本间差异 |
+| `GET /api/proposals/{id}/export` | 导出审计包：原基准快照、已应用版本快照、完整版本链、全部产物与每次决定依据 |
+
 ## 测试
 
 ```bash
@@ -105,5 +157,7 @@ CP-SAT 在 1 kHz 网格上为每个载波选中心频率，约束：
 PYTHONPATH=backend pytest backend/tests -q
 ```
 
-19 个测试覆盖：dBm/W 换算、三类冲突对定位、泄漏方向性、三种极化规则、
-两种规划模式的可行性与规划后零越界、场景 CRUD 等。
+33 个测试覆盖：dBm/W 换算、三类冲突对定位、泄漏方向性、三种极化规则、
+两种规划模式的可行性与规划后零越界、场景 CRUD，以及版本化提案的
+创建/多频点移动/评审/应用/post-check、基准并发冲突拦截、旧规划哈希失效、
+取消/重复应用/回退幂等、审计导出等。

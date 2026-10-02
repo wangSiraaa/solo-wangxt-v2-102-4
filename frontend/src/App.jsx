@@ -7,6 +7,7 @@ import PowerSummary from './components/PowerSummary.jsx'
 import BandChart from './components/BandChart.jsx'
 import SpectrumChart from './components/SpectrumChart.jsx'
 import MaskPreview from './components/MaskPreview.jsx'
+import ProposalPanel from './components/ProposalPanel.jsx'
 
 const EMPTY_RULES = { guard_required_mhz: 1.0, leakage_limit_dbm: -45.0, reuse_policy: {} }
 
@@ -28,9 +29,20 @@ export default function App() {
   const [planMode, setPlanMode] = useState('guard_only')
   const [planView, setPlanView] = useState(false)
   const [tab, setTab] = useState('spectrum')
+  const [page, setPage] = useState('workbench')
   const [selectedPair, setSelectedPair] = useState(null)
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
+
+  // 提案应用/回退后重新载入场景基准（直接分析视图也随之刷新）
+  const reloadCurrentScenario = useCallback(async () => {
+    if (scenarioId == null) {
+      await refreshScenarios()
+      return
+    }
+    await loadScenario(scenarioId)
+    await refreshScenarios()
+  }, [scenarioId])  // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     api.masks().then(setMasks).catch((e) => setError(String(e)))
@@ -115,6 +127,21 @@ export default function App() {
   }
 
   const status = analysis?.status
+  // 提案面板需要的“当前场景基准”对象（含版本号）；未选择保存场景时为 null
+  const scenarioForProposal = useMemo(() => {
+    if (scenarioId == null) return null
+    return {
+      id: scenarioId, name: scenarioName,
+      description: '',
+      band_low_mhz: band.low, band_high_mhz: band.high,
+      guard_required_mhz: rules.guard_required_mhz,
+      leakage_limit_dbm: rules.leakage_limit_dbm,
+      reuse_policy: rules.reuse_policy || {},
+      carriers,
+      // 版本号以服务端列表为准（本地编辑后更新），乐观冲突提示依赖它
+      version: scenarios.find((s) => s.id === scenarioId)?.version ?? 0,
+    }
+  }, [scenarioId, scenarioName, band, rules, carriers, scenarios])
   // 频段图始终显示录入频带（按原始冲突着色），规划位置以绿色描边框叠加
   const shownBands = analysis?.bands
   const shownFindings = analysis?.findings || []
@@ -131,14 +158,24 @@ export default function App() {
       <header className="app-header">
         <h1>📡 频谱工作台</h1>
         <span className="badge-offline">离线简化模型 · 不连接设备 · 不生成发射指令</span>
+        <span className="seg page-tabs">
+          <button className={page === 'workbench' ? 'on' : ''} onClick={() => setPage('workbench')}>分析与规划</button>
+          <button className={page === 'proposals' ? 'on' : ''} onClick={() => setPage('proposals')}>调频提案（版本化）</button>
+        </span>
         <span className="spacer" />
-        {shownStatus && (
+        {shownStatus && page === 'workbench' && (
           <span className={`status-pill ${shownStatus}`}>
             {shownStatus === 'ok' ? '满足规则' : shownStatus === 'conflict' ? '存在冲突' : '需要关注'}
           </span>
         )}
       </header>
 
+      {page === 'proposals' ? (
+        <div className="proposal-page">
+          <ProposalPanel scenario={scenarioForProposal} masks={masks}
+                         onScenarioChanged={reloadCurrentScenario} />
+        </div>
+      ) : (
       <div className="layout">
         {/* 左列：录入与规则 */}
         <div>
@@ -263,6 +300,7 @@ export default function App() {
           </div>
         </div>
       </div>
+      )}
     </>
   )
 }
